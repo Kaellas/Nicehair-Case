@@ -1,0 +1,631 @@
+---
+title: "Nicehair Technical Report"
+author: 'BI Experts: Pawel Gach, Bu Bu Zhang, Aleksandra Kusz'
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyr) # For data manipulation
+library(dplyr) # For data manipulation
+library(forcats) # For factorization
+library(cluster) # For k-means clustering
+library(fastDummies) # For dummy encoding
+library(arules) # For association rules mining
+library(arulesViz) # For visualisation of ASM
+```
+
+# Introduction
+
+In the rapidly evolving world of e-commerce, leveraging data for actionable insights has become essential for maintaining a competitive edge. Nicehair, a leading retailer in the beauty industry, possesses a vast amount of customer data detailing transactions and purchasing behaviors. However, the potential of this data has yet to be fully harnessed, resulting in missed opportunities for targeted marketing, precision recommendations, and ultimately, increased profitability.
+
+## Problem Statement
+
+The core challenge lies in unlocking the value within Nicehair's data, particularly in identifying purchase patterns, product relationships, and cross-selling opportunities. A data-driven solution can address this challenge with:
+
+1.  **Customer Segmentation:** Grouping customers based on purchasing behaviors, allowing for tailored marketing strategies and product recommendations.
+
+2.  **Product Recommendations:** Applying rule-seeking models to uncover relationships between different products, thereby creating opportunities for upselling and cross-selling.
+
+## Data
+
+To solve this problem, we utilize a comprehensive dataset comprising 344,056 transactions spanning from January 1, 2024, to March 21, 2024. This dataset includes details about each transaction together with Google Analytics 4 data, more specifically:
+
+-   **Transaction details:** transaction_date, user_id, transaction_id, transaction_line_number, product_id and product_name associated with each transaction.
+-   **Customer information:** Including demographic and tracking data like country, brand, source/medium, campaign ID, default_channel_group, city, browser, device, operating system and revenue.
+
+## GitHub Repository
+
+For the full, working codebase, extracted rules, visualisations, as well as the un-knitted R markdown file, please refer to our [**GitHub repository**](https://github.com/Kaellas/Nicehair-Case "https://github.com/Kaellas/Nicehair-Case").
+
+\newpage
+# Methodology
+
+An overview of the analytical approaches used, including segmentation, predictive modeling, and association rules mining.
+
+The external libraries used are as follows:
+
+``` r
+library(tidyr) # For data manipulation
+library(dplyr) # For data manipulation
+library(forcats) # For factorization
+library(cluster) # For k-means clustering
+library(fastDummies) # For dummy encoding
+library(arules) # For association rules mining
+library(arulesViz) # For visualisation of ASM
+```
+
+## Handling NA values
+
+```{r include=FALSE}
+data <-
+  read.csv("/Users/pawelgach/Documents/Aarhus Uni/Nicehair Case/nicehair.csv")
+```
+
+After initialising the dataset within R, we proceed with initial analysis to understand its structure and key statistics.
+
+```{r, echo = T}
+# Function to calculate proportions of NAs and empty strings in a column
+proportion_missing <- function(x) {
+  na_prop <- mean(is.na(x))  # Proportion of NAs
+  empty_prop <- mean(x == "")  # Proportion of empty strings
+  return(c(na_prop, empty_prop))
+}
+
+# Applying this function to each column
+missing_summary <- t(apply(data, 2, proportion_missing))
+
+rownames(missing_summary) <- colnames(data)
+colnames(missing_summary) <- c("NA_Proportion", "Empty_String_Proportion")
+
+print(missing_summary)
+```
+
+An immediately noticed problem is that a significant portion (\~17%) of the data contains missing values in the Google Analytics columns related to customer information - revenue, source/medium and so on. Since it is impossible to find clusters without identyfing variables, we decided to delete the rows with missing data.
+
+```{r}
+data <- data[!is.na(data$revenue),]
+```
+
+Furthermoe, the `source_medium` column contains information about the source and medium of each transaction, separated by a "/". We split this column into two:
+
+```{r, warning=FALSE}
+data <- data %>%
+  separate(col = source_medium, into = c("source", "medium"), sep = "/")
+```
+
+To handle remaining missing values in the `medium` column, we replace them with "(not set)":
+
+```{r}
+data$medium[is.na(data$medium)] <- "(not set)"
+```
+
+### Handling "(not set)" strings
+
+Several columns contain entries labeled "(not set)" instead of actual values or NA. We assess the prevalence of these entries as follows:
+
+```{r, echo = T}
+for (i in 1:ncol(data)) {
+  if(i == 1) {
+    cat(sprintf(
+      "%-3s %-25s %-15s %-5s\n", 
+      "ID", "Column Name", "Not Set Count", "Proportion"
+    ))
+  }
+  if (is.character(data[, i])) {
+    not_set_count <- sum(data[, i] == "(not set)")
+    formatted_output <- sprintf(
+      "%-3s %-25s %-15s %-5s",
+      i,
+      colnames(data)[i],
+      not_set_count,
+      round(not_set_count / nrow(data), 2)
+    )
+    cat(formatted_output, "\n")
+  }
+}
+```
+
+Notably, campaign_id has 0.45% of entries as (not set), however this is not a problem as not every sale has to be tied to a campaign
+
+However, we observe that the `device` column has a high incompleteness rate of 89% and contains redundant information, since the `operating_system` column contains similiar information. Therefore, we remove it from the dataset:
+
+```{r}
+data <- subset(data, select = -device)
+```
+
+## Feature Engineering
+
+To simplify the analysis, we convert the long alphanumeric identifiers from the `user_id` and `transaction_id` columns into numeric IDs, while retaining the original identifiers for later use.
+
+```{r}
+# Mapping user IDs
+user_mapping <- data.frame(
+  user_original = levels(factor(data$user_id)),
+  user_numeric = seq_along(levels(factor(data$user_id))
+))
+
+# Mapping transaction IDs
+transaction_mapping <- data.frame(
+  transaction_original = levels(factor(data$transaction_id)),
+  transaction_numeric = seq_along(levels(factor(data$transaction_id))
+))
+
+# Converting to numeric
+data$user_id <- as.numeric(factor(data$user_id))
+data$transaction_id <- as.numeric(factor(data$transaction_id))
+```
+
+After cleaning, the `country` column only contains a single variable (`DK`), making it redundant.
+
+```{r}
+data <- subset(data, select = -country)
+```
+
+To reduce repetition, we retain only rows with the highest `transaction_line_number` per transaction ID. This approach retains the useful information about the user's basket size and deletes redundant rows.
+
+```{r}
+data <- data %>%
+  group_by(transaction_id) %>%
+  filter(transaction_line_number == max(transaction_line_number)) %>%
+  ungroup()
+```
+
+The Google Analytics columns contain categorical data that needs to be converted to factors to be used in analysis.
+
+```{r}
+cols <- c(
+  "brand", "source", "medium", "campaign_id",
+  "default_channel_group", "city", "browser", "operating_system"
+)
+
+for (col in cols) {
+  data[[col]] <- factor(data[[col]])
+}
+```
+
+To reduce dimensionality before dummy encoding, we select the top 5 factor levels from each columns and lump the rest.
+
+```{r}
+data_lump <- data %>%
+  mutate_if(is.factor, ~ fct_lump(., n = 5))
+
+data_dummies <- dummy_cols(data_lump, select_columns = cols)
+
+# Removing the original factors
+data_dummies <- data_dummies %>% select_if(~ !is.factor(.))
+```
+
+Finally, we remove columns irrelevant to the upcoming analysis. The date is irrelevant due to the low collection period of the data, while product columns range in the thousands, which makes lumping them a large loss of information.
+
+```{r}
+data_dummies <- subset(data_dummies, select = -c(transaction_date, product_id, product_name))
+```
+
+## Data Reduction
+
+To prepare the dataset for customer segmentation, we first aggregate and summarize unique information for each user.
+
+```{r}
+data_users <- data_dummies %>%
+  group_by(user_id) %>%
+  summarise(
+    revenue = sum(revenue),
+    num_transactions = length(transaction_id),
+    total_products = sum(transaction_line_number),
+    across(5:52, ~ as.integer(any(.x == 1)), .names = "{.col}_flag")
+  )
+```
+
+This step consolidates the dataset to a unique record for each user, including:
+
+-   **Revenue:** The total revenue generated by each user.
+-   **Number of Transactions:** The count of transactions per user.
+-   **Total Products:** The total number of products bought by each user.
+-   **Dummy Columns:** Flags indicating the presence of specific factors.
+
+As user_id is now a unique identifier, we proceed without it
+
+```{r}
+data_ready <- data_users[, -1]
+```
+
+### Distribution of Revenue
+
+To understand the distribution of revenue per user, we create a histogram:
+
+```{r, echo=TRUE}
+hist(
+  data_ready$revenue,
+  main = "Histogram of Revenue (Full)",
+  xlab = "Revenue",
+  col = "blue",
+  breaks = 30
+)
+```
+
+This reveals the skewness of the revenue distribution, indicating that most users contribute lower amounts with few extreme spenders.
+
+We address the skewness by limiting the revenue distribution to the 95th percentile:
+
+```{r, echo=TRUE}
+limits <- quantile(data_ready$revenue, probs = c(0, 0.95))
+filtered_revenue <-
+  data_ready$revenue[data_ready$revenue > limits[1] &
+                       data_ready$revenue < limits[2]]
+hist(
+  filtered_revenue,
+  main = "Histogram of Revenue (up to 95th Percentile)",
+  xlab = "Revenue",
+  col = "blue",
+  breaks = 30
+)
+```
+
+This provides a clearer picture of the revenue distribution by removing outliers. The immediate source of concern that can be observed from the histogram is that revenue is, overall, normally distributed. This may lead to it being very hard or impossible to cluster, since it may have no natural or reproducible clusters.
+
+### Principal Component Analysis
+
+To prepare the dataset for further analysis, the only numeric variable, `revenue`, is scaled. This will let us observe its variance distribution on the same level as the dummy-encoded variables later down the line.
+
+```{r}
+data_ready$revenue <- scale(data_ready$revenue)
+```
+
+We then reduce the dataset's dimensionality using Principal Component Analysis.
+
+```{r, echo = TRUE}
+data_pca <- prcomp(data_ready, scale. = T)
+```
+
+This provides a calculation of the variance explained by each principal component. To limit the dimensionality of the data, we retain components that contribute to 95% of the variance - 29 in total.
+
+```{r}
+cumulative_variance <- summary(data_pca)$importance[3, ]
+num_components_to_keep <- max(which(cumulative_variance <= 0.95))
+data_reduced <- data_pca$x[, 1:num_components_to_keep]
+```
+
+\newpage
+## Customer Segmentation
+
+Since the dataset contains both scaled numeric data and dummy-encoded variables, as well as due to the fact that the dataset's dimensionality exceeds the limits of R's vectors, we decide to proceed with non-hierarchical k-means clustering using the `cluster` library
+
+### Finding the Optimal Number of Clusters
+
+To determine the appropriate number of clusters for customer segmentation, we apply the k-means algorithm and examine the within-cluster sum of squares (WSS) for different values of $k$:
+
+```{r, echo = TRUE}
+set.seed(123) # For reproducibility
+
+# WSS values for 1-10 clusters
+wss <- sapply(1:10, function(k) {
+  kmeans(data_reduced, k, nstart = 10)$tot.withinss
+})
+
+# Plotting WSS
+plot(1:10,
+     wss,
+     type = "b",
+     xlab = "Number of Clusters",
+     ylab = "Within groups sum of squares")
+```
+
+The resultant elbow plot is a bit vague due to the nature of the dataset, but we deduce that it shows a decrease in WSS until 4 clusters, suggesting that 4 is an appropriate number for $k$.
+
+### K-means Clustering
+
+We perform k-means clustering with 4 clusters and 25 random starts. We then attach the resultant cluster vector to the pre-PCA dataset.
+
+```{r}
+set.seed(123)
+km_clust <- kmeans(data_reduced, centers = 4, nstart = 25)
+data_ready$clust <- as.factor(km_clust$cluster)
+```
+
+We can observe the distribution of data across the clusters before delving deeper into the analysis.
+
+```{r, echo = TRUE}
+table(data_ready$clust)
+```
+
+The clusters seem to be slightly imbalanced in terms of size, but that is not necessarily a problem in of itself.
+
+### Inter-cluster Variance
+
+To identify variables with the highest variance between clusters, we calculate and sort their variance:
+
+```{r, echo = TRUE, warning = FALSE}
+cluster_means <- data_ready %>%
+  group_by(clust) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = 'drop')
+
+inter_cluster_variance <- cluster_means %>%
+  summarise(across(where(is.numeric), var, na.rm = TRUE)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "variance")
+
+high_inter_cluster_variance <- inter_cluster_variance %>%
+  arrange(desc(variance))
+```
+
+We then view the variables with the highest inter-cluster variance.
+
+```{r, echo = T}
+print(high_inter_cluster_variance, n = 20)
+```
+
+The products differ quite significantly in multiple of the dummy-encoded columns. However, the top products column, despite being the highest in terms of variance, is still quite small when it's units are taken into account.
+
+### Revenue Distribution by Segment
+
+The most important variable in customer segmentation is revenue, as it allows the company to manage their marketing efforts most effectively. To compare revenue across clusters, we create a boxplot.
+
+```{r, echo = TRUE}
+boxplot(
+  data_ready$revenue ~ data_ready$clust,
+  range = 10,
+  varwidth = TRUE,
+  notch = TRUE,
+  main = "Revenue Distribution by Segment",
+  xlab = "Segment",
+  ylab = "Revenue"
+)
+```
+
+Unfortunately this reveals that revenue distribution shows insignificant differences between clusters.
+
+### ANOVA for Validity
+
+To ensure variables are valid predictors, we perform an ANOVA test on all the variables. The output can be seen in Appendix 2, but overall over 90% of the variables are significant, which supports their relevance in clustering.
+
+``` r
+lapply(data_ready[, 1:51], function(x) summary(aov(x ~ clust, data = data_ready)))
+```
+
+### Variable Distribution
+
+To explore the distribution of top variables aside from numeric ones, we print their proportions. The full output is available in Appendix 3, but generally speaking, the clusters differ in columns related to source, medium and default channel.
+
+``` r
+for (i in 1:10) {
+  var_name <- high_inter_cluster_variance$variable[i]
+  
+  # Check if the column is numeric
+  if (!is.numeric(data_ready[[var_name]])) {
+    cat(var_name, "\n")
+    
+    count_table <- table(data_ready[[var_name]], data_ready$clust)
+    proportion_table <- prop.table(count_table, margin = 2)
+    print(proportion_table)
+    
+    cat("--------------------------------------\n\n")
+  }
+}
+```
+
+\newpage
+## Product Recommendation
+
+To enhance product recommendations and cross-selling opportunities, we explore associations between products based on customer transactions.
+
+First, we reload and clean the dataset once more to start fresh. The only necessary cleaning step for product recommendation is simplying transaction IDs.
+
+```{r include=FALSE}
+data <-
+  read.csv("/Users/pawelgach/Documents/Aarhus Uni/Nicehair Case/nicehair.csv")
+```
+
+```{r}
+data$transaction_id <- as.numeric(factor(data$transaction_id))
+```
+
+Second, we create a list of transactions, grouping products by `transaction_id`:
+
+```{r warning=FALSE}
+trans_list <- data %>%
+  group_by(transaction_id) %>%
+  summarise(items = list(product_name), .groups = 'drop') %>%
+  pull(items)
+
+trans_list <- lapply(trans_list, unlist)
+transactions <- as(trans_list, "transactions")
+```
+
+### Association Rules Mining
+
+We use the Apriori algorithm to mine association rules from the transaction data. It should be noted that the support is set to a very small amount due to the very high amount of products in the dataset - the products are simply spread to thin, so when support is set to a higher amount, no rules will be generated. Also notice that the threshold for confidence is set to a high percentage of 0.8, guaranteeing the algorithm will only consider the best rules under that metric.
+
+``` r
+rules <- apriori(transactions,
+          parameter = list(
+            supp = 0.00001, # Low support due to many products
+            conf = 0.8,
+            target = "rules"
+          ))
+
+summary(rules)
+```
+
+```{r include=FALSE}
+rules <- apriori(transactions,
+          parameter = list(
+            supp = 0.00001,
+            conf = 0.8,
+            target = "rules"
+          ))
+```
+
+```{r, echo = FALSE}
+summary(rules)
+```
+
+Even with the high confidence threshold, the algorithm discovers almost 13 thousand rules. To analyze them, we sort them by lift and inspect the best ones.
+
+```{r, echo = TRUE}
+top_rules <- head(sort(rules, by = "lift"), 1000)
+
+for (i in 1:10) {
+  lhs <- labels(lhs(top_rules[i]))
+  rhs <- labels(rhs(top_rules[i]))
+  con <- quality(top_rules[i])$confidence
+  lif <- quality(top_rules[i])$lift
+  
+  cat("Rule", i, ":\n")
+  cat("LHS:", lhs, "\n")
+  cat("RHS:", rhs, "\n")
+  cat("Confidence:", con, "\n")
+  cat("Lift:", lif, "\n")
+  cat("--------------------------------------\n")
+}
+```
+
+The full list of all discovered rules in a CSV format, together with a visualisation of the top rules from the `arulesViz` library in HTML format is available as part of the GitHub repository. Please note that the visualisation requires significant processing power to display properly.
+
+``` r
+# Code used to export the rules into csv
+
+rules_df <- as(rules, "data.frame")
+write.csv(rules_df, "apriori_product_rules.csv", row.names = FALSE)
+
+# Code used to visualise the rules
+plot(top_rules,
+     method = "graph",
+     engine = "htmlwidget",
+     max = 1000)
+```
+
+For simplicity, we're also including a non-interactable visualisation of the top rules.
+
+![](/Users/pawelgach/Documents/Aarhus%20Uni/Nicehair%20Case/rules/Product_Rules_Vis.png)
+
+As can be seen from the visualization, the top 1000 rules are mostly isolated - they are usually based on pairs or trios of products, with larger clusters of more complicated relations being rarer. This, however, doesn't impact the usefulness of the rules.
+
+## Brand-specific Product Recommendation
+
+Since the dataset is, unfortunately, not categorised in any way, the rules generated by association rules mining can only apply to individual products. To increase the real-life potential usability of the model, we also explore associations between brands listed in the dataset.
+
+```{r}
+data$brand <- factor(data$brand)
+
+trans_list_b <- data %>%
+  group_by(transaction_id) %>%
+  summarise(items = list(brand), .groups = 'drop') %>%
+  pull(items)
+
+trans_list_b <- lapply(trans_list_b, unlist)
+transactions_b <- as(trans_list_b, "transactions")
+```
+
+We apply the Apriori algorithm once again with similiar parameters to discover brand-level associations.
+
+``` r
+rules_b <- apriori(transactions_b,
+          parameter = list(
+            supp = 0.00001,
+            conf = 0.8,
+            target = "rules"
+          ))
+```
+
+```{r warning=FALSE, include=FALSE}
+rules_b <- apriori(transactions_b,
+          parameter = list(
+            supp = 0.00001,
+            conf = 0.8,
+            target = "rules"
+          ))
+
+```
+
+```{r, echo = TRUE}
+top_rules_b <- head(sort(rules_b, by = "lift"), 1000)
+
+for (i in 1:10) {
+  lhs <- labels(lhs(top_rules_b[i]))
+  rhs <- labels(rhs(top_rules_b[i]))
+  con <- quality(top_rules_b[i])$confidence
+  lif <- quality(top_rules_b[i])$lift
+  
+  cat("Rule", i, ":\n")
+  cat("LHS:", lhs, "\n")
+  cat("RHS:", rhs, "\n")
+  cat("Confidence:", con, "\n")
+  cat("Lift:", lif, "\n")
+  cat("--------------------------------------\n")
+}
+```
+
+The rules and visualisation for the brand-based application of apriori are also available on GitHub. Below is another non-interactable visualisation.
+
+![](/Users/pawelgach/Documents/Aarhus%20Uni/Nicehair%20Case/rules/Brand_Rules_Vis.png)
+
+In stark contrast to the product rules, the brand rules form many more complicated relationships. This is likely due to the lower amount of unique brands included in the dataset. This also doesn't impact the usefulness of the discovered rules, but it is still a notable difference.
+
+\newpage
+# Conclusions
+
+The analysis of Nicehair's data yields valuable insights into both customer segmentation and product recommendation strategies.
+
+## Customer Segmentation
+
+The k-means clustering of the dataset reveals that, while there are differences between clusters for certain variables, revenue and total products purchased remain consistent across all clusters. This finding suggests that Nicehair's current marketing strategies attract customers with similar purchasing power and behavior patterns.
+
+### Business Implications
+
+1. **Marketing Budget Reallocation:** The consistency in revenue and total purchases indicates that some high-cost marketing channels may not provide a significantly better return on investment. Therefore, Nicehair can consider reallocating the budget from more expensive channels to explore alternative strategies or to strengthen existing ones that yield similar results at a lower cost.
+
+2. **Tailored Campaigns:** The variables that differentiate clusters (such as channels, sources, or customer characteristics) can be leveraged to design targeted marketing campaigns. This can help Nicehair refine its strategies to maximize effectiveness, even within its current customer base, possibly achieving a higher repurchase rate.
+
+## Product Recommendation
+
+The association rules mining generates two extensive rule sets, which can be applied in various ways to enhance business operations:
+
+1. **Bundling Products:** The discovered associations can be used to create product bundles, allowing Nicehair to offer complementary or related items together. This not only increases sales volume per transaction (and increases average basket size) but also provides added value to customers.
+
+2. **Upselling Opportunities:** The rules can also be used to recommend related products when an item is added to a customer's basket. This can lead to increased average order value and contribute to revenue growth.
+
+### Next Steps
+
+To further optimize the product recommendation model, Nicehair can consider:
+
+1. Adding product categories and sub-categories can refine the association rules, making them more relevant and actionable.
+  
+2. By exploring additional metrics or even simple testing, Nicehair can refine the discovered rules, improving their accuracy and applicability.
+
+## Final Thoughts
+
+The insights gained from this analysis pave the way for data-driven strategies that enhance both marketing effectiveness and product recommendation systems. By leveraging these findings, Nicehair can optimize its operations, enhance customer experience, and drive further growth.
+
+\newpage
+# Appendix 1: PCA Output
+
+```{r, echo = FALSE}
+summary(data_pca)
+```
+
+\newpage
+# Appendix 2: ANOVA of Cluster Variables
+
+```{r, echo = FALSE}
+lapply(data_ready[, 1:51], function(x) summary(aov(x ~ clust, data = data_ready)))
+```
+
+\newpage
+# Appendix 3: Cluster Variable Distribution
+
+```{r, echo = FALSE}
+for (i in 1:10) {
+  var_name <- high_inter_cluster_variance$variable[i]
+  cat(var_name, "\n")
+
+  count_table <- table(data_ready[[var_name]], data_ready$clust)
+  proportion_table <- prop.table(count_table, margin = 2)
+  print(proportion_table)
+
+  cat("--------------------------------------\n\n")
+}
+```

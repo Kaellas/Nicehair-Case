@@ -23,12 +23,12 @@ data <-
 # You can easily download it with:
 # data <- read.csv("paste-URL-here")
 
+# If using the pre-final version, delete the X id column with:
+# data <- subset(data, select = -X)
+
 # Initial exploration ----------------------------------------------------------
 
 skimr::skim(data)
-
-data <- subset(data, select = -X)
-# Delete X, as it is clearly an index column
 
 data$transaction_date <-
   as.Date(data$transaction_date, format = "%A, %B %d, %Y")
@@ -63,17 +63,21 @@ data$medium[is.na(data$medium)] <- "(not set)"
 
 # Multiple Google Analytics columns also contain "(not set)" instead of NA
 for (i in 1:ncol(data)) {
+  if(i == 1) {
+    cat(sprintf(
+      "%-3s %-25s %-15s %-5s\n", 
+      "ID", "Column Name", "Not Set Count", "Proportion"
+    ))
+  }
   if (is.character(data[, i])) {
     not_set_count <- sum(data[, i] == "(not set)")
-    
     formatted_output <- sprintf(
-      "%-3s %-25s %-10s %-5s",
+      "%-3s %-25s %-15s %-5s",
       i,
       colnames(data)[i],
       not_set_count,
       round(not_set_count / nrow(data), 2)
     )
-    
     cat(formatted_output, "\n")
   }
 }
@@ -310,18 +314,20 @@ lapply(data_ready[, 1:51], function(x)
   summary(aov(x ~ clust, data = data_ready)))
 # Nearly all significant
 
-# Distribution of top variables
-# 3 to skip revenue and total products
+# Distribution of top non-numeric variables
 for (i in 1:10) {
   var_name <- high_inter_cluster_variance$variable[i]
-  cat(var_name, "\n")
   
-  count_table <- table(data_ready[[var_name]],
-                       data_ready$clust)
-  proportion_table <- prop.table(count_table, margin = 2)
-  print(proportion_table)
-  
-  cat("--------------------------------------\n\n")
+  # Check if the column is numeric
+  if (!is.numeric(data_ready[[var_name]])) {
+    cat(var_name, "\n")
+    
+    count_table <- table(data_ready[[var_name]], data_ready$clust)
+    proportion_table <- prop.table(count_table, margin = 2)
+    print(proportion_table)
+    
+    cat("--------------------------------------\n\n")
+  }
 }
 
 # No significant patterns, as the clusters do not differ in terms of revenue,
@@ -354,7 +360,6 @@ rules <-
             supp = 0.00001,
             # Set to very low due to large amount of products
             conf = 0.8,
-            maxlen = 20,
             target = "rules"
           ))
 
@@ -367,3 +372,32 @@ plot(top_rules,
 
 summary(top_rules)
 inspect(top_rules[1:100])
+
+# By brand ---------------------------------------------------------------------
+
+data$brand <- factor(data$brand)
+
+trans_list_b <- data %>%
+  group_by(transaction_id) %>%
+  summarise(items = list(brand), .groups = 'drop') %>%
+  pull(items)
+
+trans_list_b <- lapply(trans_list_b, unlist)
+transactions_b <- as(trans_list_b, "transactions")
+
+rules_b <-
+  apriori(transactions_b,
+          parameter = list(
+            supp = 0.00001,
+            conf = 0.8,
+            target = "rules"
+          ))
+
+top_rules_b <- head(sort(rules_b, by = "lift"), 1000)
+plot(top_rules_b,
+     method = "graph",
+     engine = "htmlwidget",
+     max = 1000)
+
+summary(top_rules_b)
+inspect(top_rules_b[1:100])
